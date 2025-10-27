@@ -106,6 +106,22 @@ func proxyHandler(targetURL string) http.HandlerFunc {
 	}
 }
 
+// reportFatal prints failures to both standard streams so systemd surfaces them no matter how the unit is configured.
+// We keep logging in place to preserve historical behaviour while still exiting immediately after an unrecoverable error.
+func reportFatal(message string) {
+	fmt.Fprintln(os.Stdout, message)
+	fmt.Fprintln(os.Stderr, message)
+	log.Println(message)
+}
+
+// exitWithError wraps contextual failures, reports them loudly, and terminates to avoid partial startup states.
+// Writing to STDOUT, STDERR, and the logger guarantees visibility across manual runs and systemd invocations.
+func exitWithError(context string, err error) {
+	message := fmt.Sprintf("%s: %v", context, err)
+	reportFatal(message)
+	os.Exit(1)
+}
+
 func main() {
 	// Color palette keeps help output readable on both dark and light backgrounds.
 	const (
@@ -150,6 +166,9 @@ func main() {
 	domain := flag.String("domain", "", "Domain for automatic Let's Encrypt certificate. Forces HTTP port to 80 and admin rights, HTTPS can be changed.")
 	showVersion := flag.Bool("version", false, "Show program version")
 
+	// Send log output to STDOUT so systemd captures it consistently.
+	log.SetOutput(os.Stdout)
+
 	// Parse the flags
 	flag.Parse()
 
@@ -180,8 +199,9 @@ func main() {
 	// Create the proxy handler
 	handler := proxyHandler(*targetURL)
 
-	// 'done' channel is used to keep the main goroutine running.
-	done := make(chan bool)
+	// errorChan collects startup/runtime issues from goroutines so we can surface them to systemd.
+	// Buffer keeps the channel writable even if two servers fail in quick succession during shutdown.
+	errorChan := make(chan error, 2)
 
 	// Start HTTP server. If a domain is given, this will always be on port 80.
 	// If no domain is given, this uses the user-specified port.
@@ -193,7 +213,9 @@ func main() {
 			}
 			log.Printf("Starting HTTP proxy on port %s targeting %s", *httpPort, *targetURL)
 			if err := httpServer.ListenAndServe(); err != nil && err != http.ErrServerClosed {
-				log.Fatalf("HTTP server error: %v", err)
+				wrappedErr := fmt.Errorf("HTTP server error: %w", err)
+				log.Printf("HTTP server failed: %v", err)
+				errorChan <- wrappedErr
 			}
 		}()
 	}
@@ -203,13 +225,13 @@ func main() {
 		// Obtain the user's home directory to store certificates.
 		homeDir, err := os.UserHomeDir()
 		if err != nil {
-			log.Fatalf("Failed to get user home directory: %v", err)
+			exitWithError("Failed to get user home directory", err)
 		}
 
 		// Setup the directory to store TLS certificates.
 		certDir := filepath.Join(homeDir, ".chicha-http-proxy-ssl-certs")
 		if err := os.MkdirAll(certDir, 0700); err != nil {
-			log.Fatalf("Failed to create cert directory: %v", err)
+			exitWithError("Failed to create cert directory", err)
 		}
 
 		go func() {
@@ -227,11 +249,16 @@ func main() {
 
 			log.Printf("Starting HTTPS proxy on domain %s and port %s targeting %s", *domain, *httpsPort, *targetURL)
 			if err := httpsServer.ListenAndServeTLS("", ""); err != nil && err != http.ErrServerClosed {
-				log.Fatalf("HTTPS server error: %v", err)
+				wrappedErr := fmt.Errorf("HTTPS server error: %w", err)
+				log.Printf("HTTPS server failed: %v", err)
+				errorChan <- wrappedErr
 			}
 		}()
 	}
 
-	// Block until something signals the 'done' channel.
-	<-done
+	// Block until a goroutine reports an unrecoverable error so we can show it directly.
+	if err := <-errorChan; err != nil {
+		reportFatal(fmt.Sprintf("Fatal error: %v", err))
+		os.Exit(1)
+	}
 }
