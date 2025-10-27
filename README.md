@@ -77,29 +77,30 @@ sudo chicha-http-proxy --domain=your-domain.com --https-port=8443 --target-url=h
 
 1. **Create a Service File**:
    ```bash
-   sudo mcedit /etc/systemd/system/chicha-http-proxy.service
+   sudo vim /etc/systemd/system/chicha-http-proxy.service
    ```
 
 2. **Add the Following Configuration**:
-   ```ini
-   [Unit]
-   Description=Chicha HTTP Proxy
-   After=network.target
+   ```
+[Unit]
+Description=Chicha HTTP Proxy
+After=network.target
 
-   [Service]
-   ExecStart=/usr/local/bin/chicha-http-proxy --domain=your-domain.com --target-url=https://twochicks.ru
-   Restart=on-failure
+[Service]
+User=root
+ExecStart=/usr/local/bin/chicha-http-proxy -domain=DOMAIN.COM -target-url=https://127.0.0.1:8080
+Restart=on-failure
 
-   [Install]
-   WantedBy=multi-user.target
+[Install]
+WantedBy=multi-user.target
    ```
 
 3. **Enable and Start the Service**:
    ```bash
-   sudo systemctl daemon-reload
-   sudo systemctl enable chicha-http-proxy
-   sudo systemctl start chicha-http-proxy
-   sudo systemctl status chicha-http-proxy
+   systemctl daemon-reload
+   systemctl enable chicha-http-proxy
+   systemctl start chicha-http-proxy
+   systemctl status chicha-http-proxy
    ```
 
 ---
