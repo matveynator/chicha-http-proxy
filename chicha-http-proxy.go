@@ -8,6 +8,7 @@ import (
 	"golang.org/x/crypto/acme/autocert"
 	"io"
 	"log"
+	"net"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -18,7 +19,7 @@ var version = "dev"
 
 // proxyHandler returns an HTTP handler function that forwards incoming requests
 // to a specified target URL (reverse proxy functionality).
-func proxyHandler(targetURL string) http.HandlerFunc {
+func proxyHandler(targetURL string, forwardedHost string) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		// Attempt to read the request body (if present)
 		var body []byte
@@ -55,6 +56,22 @@ func proxyHandler(targetURL string) http.HandlerFunc {
 					req.Header.Add(header, value)
 				}
 			}
+
+			// Populate X-Forwarded-* headers so the upstream can recover client context.
+			// Using Set ensures we do not accumulate duplicates if the client already supplied values.
+			forwardedFor := r.RemoteAddr
+			if host, _, err := net.SplitHostPort(r.RemoteAddr); err == nil {
+				forwardedFor = host
+			}
+			req.Header.Set("X-Forwarded-For", forwardedFor)
+			req.Header.Set("X-Forwarded-Proto", "https")
+			// Prefer the configured domain for X-Forwarded-Host so upstream logs show the public entry point.
+			headerHost := forwardedHost
+			if headerHost == "" {
+				// Falling back to the incoming Host keeps development setups functional.
+				headerHost = r.Host
+			}
+			req.Header.Set("X-Forwarded-Host", headerHost)
 
 			// Preserve the query string parameters
 			req.URL.RawQuery = r.URL.RawQuery
@@ -197,7 +214,7 @@ func main() {
 	}
 
 	// Create the proxy handler
-	handler := proxyHandler(*targetURL)
+	handler := proxyHandler(*targetURL, *domain)
 
 	// errorChan collects startup/runtime issues from goroutines so we can surface them to systemd.
 	// Buffer keeps the channel writable even if two servers fail in quick succession during shutdown.
