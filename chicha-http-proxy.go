@@ -10,6 +10,7 @@ import (
 	"log"
 	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"path/filepath"
 )
@@ -17,9 +18,27 @@ import (
 // Program version (will be printed if the --version flag is used)
 var version = "dev"
 
-// proxyHandler returns an HTTP handler function that forwards incoming requests
-// to a specified target URL (reverse proxy functionality).
-func proxyHandler(targetURL string) http.HandlerFunc {
+// hostSelectionMode enumerates how we pick the upstream Host header so callers can switch strategies explicitly.
+type hostSelectionMode int
+
+const (
+	// hostFromDomain ensures the backend sees the public hostname and satisfies providers that validate it.
+	hostFromDomain hostSelectionMode = iota
+	// hostFromTarget keeps the upstream host equal to the target URL for setups where SNI must match the backend.
+	hostFromTarget
+)
+
+// proxyConfig centralises all knobs so the handler stays simple and testable.
+type proxyConfig struct {
+	targetURL     string
+	forwardedHost string
+	upstreamHost  string
+	hostMode      hostSelectionMode
+	transport     *http.Transport
+}
+
+// proxyHandler returns an HTTP handler function that forwards incoming requests to a specified target URL (reverse proxy functionality).
+func proxyHandler(cfg proxyConfig) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		// Attempt to read the request body (if present)
 		var body []byte
@@ -34,12 +53,12 @@ func proxyHandler(targetURL string) http.HandlerFunc {
 		}
 
 		// Construct the initial forwarding URL by combining the target URL with the requested path
-		originalURL := targetURL + r.URL.Path
+		originalURL := cfg.targetURL + r.URL.Path
 		currentURL := originalURL
 
 		// Create an HTTP client for making outgoing requests to the target server.
 		// We skip certificate verification because the proxy is meant to trust the upstream blindly.
-		client := &http.Client{Transport: &http.Transport{TLSClientConfig: &tls.Config{InsecureSkipVerify: true}}}
+		client := &http.Client{Transport: cfg.transport}
 
 		for {
 			// Create a new outgoing request using the incoming request's method, headers, and body.
@@ -65,7 +84,23 @@ func proxyHandler(targetURL string) http.HandlerFunc {
 			}
 			req.Header.Set("X-Forwarded-For", forwardedFor)
 			req.Header.Set("X-Forwarded-Proto", "https")
-			req.Header.Set("X-Forwarded-Host", r.Host)
+
+			// Determine which host should be visible to the upstream based on the configured strategy.
+			// Keeping this centralised avoids subtle header divergence across Host and X-Forwarded-Host.
+			backendHost := cfg.forwardedHost
+			if backendHost == "" || cfg.hostMode == hostFromTarget {
+				backendHost = cfg.upstreamHost
+			}
+
+			forwardedHost := cfg.forwardedHost
+			if forwardedHost == "" {
+				forwardedHost = backendHost
+			}
+
+			// Enforce Host headers so origin servers and logs observe the configured host while X-Forwarded-Host keeps the public entry point when required.
+			req.Host = backendHost
+			req.Header.Set("Host", backendHost)
+			req.Header.Set("X-Forwarded-Host", forwardedHost)
 
 			// Preserve the query string parameters
 			req.URL.RawQuery = r.URL.RawQuery
@@ -175,6 +210,7 @@ func main() {
 	httpsPort := flag.String("https-port", "443", "Port for the HTTPS server (only used if -domain is set).")
 	targetURL := flag.String("target-url", "https://twochicks.ru", "Target URL for forwarding requests.")
 	domain := flag.String("domain", "", "Domain for automatic Let's Encrypt certificate. Forces HTTP port to 80 and admin rights, HTTPS can be changed.")
+	hostModeFlag := flag.String("host-mode", "domain", "Controls which host is forwarded upstream: 'domain' keeps the public name, 'target' preserves the backend host.")
 	showVersion := flag.Bool("version", false, "Show program version")
 
 	// Send log output to STDOUT so systemd captures it consistently.
@@ -207,8 +243,29 @@ func main() {
 		fmt.Printf("No domain specified. Running HTTP on port %s only.\n", *httpPort)
 	}
 
-	// Create the proxy handler
-	handler := proxyHandler(*targetURL)
+	parsedTarget, err := url.Parse(*targetURL)
+	if err != nil {
+		exitWithError("Failed to parse target URL", err)
+	}
+
+	hostMode := hostFromDomain
+	switch *hostModeFlag {
+	case "domain":
+		hostMode = hostFromDomain
+	case "target":
+		hostMode = hostFromTarget
+	default:
+		exitWithError("Invalid host-mode value", fmt.Errorf("%s", *hostModeFlag))
+	}
+
+	transport := &http.Transport{TLSClientConfig: &tls.Config{InsecureSkipVerify: true}}
+	handler := proxyHandler(proxyConfig{
+		targetURL:     *targetURL,
+		forwardedHost: *domain,
+		upstreamHost:  parsedTarget.Host,
+		hostMode:      hostMode,
+		transport:     transport,
+	})
 
 	// errorChan collects startup/runtime issues from goroutines so we can surface them to systemd.
 	// Buffer keeps the channel writable even if two servers fail in quick succession during shutdown.
