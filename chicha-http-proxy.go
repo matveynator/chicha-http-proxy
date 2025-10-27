@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"crypto/tls"
 	"flag"
 	"fmt"
 	"golang.org/x/crypto/acme/autocert"
@@ -12,8 +13,45 @@ import (
 	"path/filepath"
 )
 
+// ANSI color codes are kept in one place so styling changes remain easy to tweak.
+const (
+	colorReset   = "\033[0m"
+	colorTitle   = "\033[95m"
+	colorSection = "\033[96m"
+	colorText    = "\033[97m"
+	colorExample = "\033[92m"
+	colorWarn    = "\033[93m"
+)
+
 // Program version (will be printed if the --version flag is used)
 var version = "dev"
+
+// configureUsage sets a colorful usage message so operators can quickly discover how to run the proxy.
+func configureUsage() {
+	flag.Usage = func() {
+		fmt.Printf("%sChicha HTTP Proxy%s\n", colorTitle, colorReset)
+		fmt.Printf("%sTransparent reverse proxy with optional automatic TLS.%s\n\n", colorText, colorReset)
+
+		fmt.Printf("%sUsage:%s\n", colorSection, colorReset)
+		fmt.Printf("  chicha-http-proxy [flags]\n\n")
+
+		fmt.Printf("%sFlags:%s\n", colorSection, colorReset)
+		flag.VisitAll(func(f *flag.Flag) {
+			fmt.Printf("  %s-%s%s %s(default: %q)%s\n",
+				colorTitle, f.Name, colorReset,
+				colorText, f.DefValue, colorReset,
+			)
+			fmt.Printf("    %s%s%s\n", colorText, f.Usage, colorReset)
+		})
+
+		fmt.Printf("\n%sQuick start:%s\n", colorSection, colorReset)
+		fmt.Printf("  %sMinimal:%s chicha-http-proxy --target-url https://example.com\n", colorExample, colorReset)
+		fmt.Printf("  %sAdvanced:%s chicha-http-proxy --target-url https://example.com --domain proxy.example.com --https-port 8443\n", colorExample, colorReset)
+
+		fmt.Printf("\n%sNotes:%s\n", colorSection, colorReset)
+		fmt.Printf("  %sThis proxy skips target TLS verification because intermediate TLS errors are not relevant to chained setups.%s\n", colorWarn, colorReset)
+	}
+}
 
 // proxyHandler returns an HTTP handler function that forwards incoming requests
 // to a specified target URL (reverse proxy functionality).
@@ -26,7 +64,7 @@ func proxyHandler(targetURL string) http.HandlerFunc {
 			body, err = io.ReadAll(r.Body)
 			if err != nil {
 				http.Error(w, "Failed to read request body", http.StatusInternalServerError)
-				log.Printf("Error reading request body: %v", err)
+				log.Printf("%sError%s reading request body: %v", colorWarn, colorReset, err)
 				return
 			}
 		}
@@ -35,15 +73,21 @@ func proxyHandler(targetURL string) http.HandlerFunc {
 		originalURL := targetURL + r.URL.Path
 		currentURL := originalURL
 
-		// Create an HTTP client for making outgoing requests to the target server
-		client := &http.Client{}
+		// Create an HTTP client for making outgoing requests to the target server.
+		// TLS verification is disabled intentionally because this proxy may sit in front of
+		// services that use custom or short-lived certificates, and we prefer smooth traffic flow.
+		client := &http.Client{
+			Transport: &http.Transport{
+				TLSClientConfig: &tls.Config{InsecureSkipVerify: true},
+			},
+		}
 
 		for {
 			// Create a new outgoing request using the incoming request's method, headers, and body.
 			req, err := http.NewRequest(r.Method, currentURL, bytes.NewReader(body))
 			if err != nil {
 				http.Error(w, "Failed to create request", http.StatusInternalServerError)
-				log.Printf("Error creating request: %v", err)
+				log.Printf("%sError%s creating request: %v", colorWarn, colorReset, err)
 				return
 			}
 
@@ -61,7 +105,7 @@ func proxyHandler(targetURL string) http.HandlerFunc {
 			resp, err := client.Do(req)
 			if err != nil {
 				http.Error(w, "Error forwarding request", http.StatusBadGateway)
-				log.Printf("Error forwarding request: %v", err)
+				log.Printf("%sError%s forwarding request: %v", colorWarn, colorReset, err)
 				return
 			}
 			defer resp.Body.Close()
@@ -71,11 +115,11 @@ func proxyHandler(targetURL string) http.HandlerFunc {
 				location, err := resp.Location()
 				if err != nil {
 					http.Error(w, "Failed to handle redirect", http.StatusInternalServerError)
-					log.Printf("Error handling redirect: %v", err)
+					log.Printf("%sError%s handling redirect: %v", colorWarn, colorReset, err)
 					return
 				}
 				currentURL = location.String()
-				log.Printf("Redirecting to: %s", currentURL)
+				log.Printf("%sRedirect%s Following redirect to %s", colorSection, colorReset, currentURL)
 				continue
 			}
 
@@ -92,12 +136,12 @@ func proxyHandler(targetURL string) http.HandlerFunc {
 			// Copy the response body
 			responseBody, err := io.ReadAll(resp.Body)
 			if err != nil {
-				log.Printf("Error reading response body: %v", err)
+				log.Printf("%sError%s reading response body: %v", colorWarn, colorReset, err)
 				return
 			}
 			_, err = w.Write(responseBody)
 			if err != nil {
-				log.Printf("Error writing response body: %v", err)
+				log.Printf("%sError%s writing response body: %v", colorWarn, colorReset, err)
 			}
 			return
 		}
@@ -105,6 +149,13 @@ func proxyHandler(targetURL string) http.HandlerFunc {
 }
 
 func main() {
+	// Colorful logging helps operators read console output faster when juggling multiple proxies.
+	log.SetFlags(0)
+	log.SetPrefix(colorSection + "[proxy] " + colorReset)
+
+	// Enable the custom usage renderer before parsing flags so users always see the styled help.
+	configureUsage()
+
 	// Define command-line flags
 	httpPort := flag.String("http-port", "80", "Port for the HTTP server. If -domain is set, this is forced to 80.")
 	httpsPort := flag.String("https-port", "443", "Port for the HTTPS server (only used if -domain is set).")
@@ -123,7 +174,7 @@ func main() {
 
 	// The target URL must be specified.
 	if *targetURL == "" {
-		log.Fatal("Target URL (--target-url) is not specified")
+		log.Fatal(colorWarn + "Target URL (--target-url) is not specified" + colorReset)
 	}
 
 	// If a domain is provided for certificate retrieval:
@@ -131,12 +182,12 @@ func main() {
 	// - Allow user to specify HTTPS port (default 443), if desired.
 	if *domain != "" {
 		*httpPort = "80"
-		log.Printf("Domain specified. HTTP port forced to 80. HTTPS port: %s", *httpsPort)
+		log.Printf("%sDomain%s HTTP port forced to 80. HTTPS port: %s", colorSection, colorReset, *httpsPort)
 	} else {
 		// If no domain is specified:
 		// - The user can use any HTTP port they like.
 		// - No HTTPS will be started as no certificate is requested.
-		fmt.Printf("No domain specified. Running HTTP on port %s only.\n", *httpPort)
+		fmt.Printf("%sNo domain specified.%s Running HTTP on port %s only.\n", colorWarn, colorReset, *httpPort)
 	}
 
 	// Create the proxy handler
@@ -153,9 +204,9 @@ func main() {
 				Addr:    ":" + *httpPort,
 				Handler: handler,
 			}
-			log.Printf("Starting HTTP proxy on port %s targeting %s", *httpPort, *targetURL)
+			log.Printf("%sHTTP%s Starting HTTP proxy on port %s targeting %s", colorTitle, colorReset, *httpPort, *targetURL)
 			if err := httpServer.ListenAndServe(); err != nil && err != http.ErrServerClosed {
-				log.Fatalf("HTTP server error: %v", err)
+				log.Fatalf("%sError%s HTTP server error: %v", colorWarn, colorReset, err)
 			}
 		}()
 	}
@@ -165,13 +216,13 @@ func main() {
 		// Obtain the user's home directory to store certificates.
 		homeDir, err := os.UserHomeDir()
 		if err != nil {
-			log.Fatalf("Failed to get user home directory: %v", err)
+			log.Fatalf("%sError%s Failed to get user home directory: %v", colorWarn, colorReset, err)
 		}
 
 		// Setup the directory to store TLS certificates.
 		certDir := filepath.Join(homeDir, ".chicha-http-proxy-ssl-certs")
 		if err := os.MkdirAll(certDir, 0700); err != nil {
-			log.Fatalf("Failed to create cert directory: %v", err)
+			log.Fatalf("%sError%s Failed to create cert directory: %v", colorWarn, colorReset, err)
 		}
 
 		go func() {
@@ -187,9 +238,9 @@ func main() {
 				Handler:   handler,
 			}
 
-			log.Printf("Starting HTTPS proxy on domain %s and port %s targeting %s", *domain, *httpsPort, *targetURL)
+			log.Printf("%sHTTPS%s Starting HTTPS proxy on domain %s and port %s targeting %s", colorTitle, colorReset, *domain, *httpsPort, *targetURL)
 			if err := httpsServer.ListenAndServeTLS("", ""); err != nil && err != http.ErrServerClosed {
-				log.Fatalf("HTTPS server error: %v", err)
+				log.Fatalf("%sError%s HTTPS server error: %v", colorWarn, colorReset, err)
 			}
 		}()
 	}
