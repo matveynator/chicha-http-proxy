@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"crypto/tls"
 	"flag"
 	"fmt"
 	"golang.org/x/crypto/acme/autocert"
@@ -35,8 +36,9 @@ func proxyHandler(targetURL string) http.HandlerFunc {
 		originalURL := targetURL + r.URL.Path
 		currentURL := originalURL
 
-		// Create an HTTP client for making outgoing requests to the target server
-		client := &http.Client{}
+		// Create an HTTP client for making outgoing requests to the target server.
+		// We skip certificate verification because the proxy is meant to trust the upstream blindly.
+		client := &http.Client{Transport: &http.Transport{TLSClientConfig: &tls.Config{InsecureSkipVerify: true}}}
 
 		for {
 			// Create a new outgoing request using the incoming request's method, headers, and body.
@@ -105,6 +107,42 @@ func proxyHandler(targetURL string) http.HandlerFunc {
 }
 
 func main() {
+	// Color palette keeps help output readable on both dark and light backgrounds.
+	const (
+		colorReset       = "\033[0m"
+		colorTitle       = "\033[38;5;39m"
+		colorSection     = "\033[38;5;69m"
+		colorHighlight   = "\033[38;5;208m"
+		colorDescription = "\033[38;5;244m"
+	)
+
+	// Custom usage function keeps the CLI friendly and shows minimal and advanced recipes.
+	flag.Usage = func() {
+		fmt.Printf("%sChicha HTTP Proxy%s\n", colorTitle, colorReset)
+		fmt.Printf("%sMinimalist reverse proxy with optional automatic TLS.%s\n\n", colorDescription, colorReset)
+
+		fmt.Printf("%sUsage%s\n", colorSection, colorReset)
+		fmt.Printf("  chicha-http-proxy [flags]\n\n")
+
+		fmt.Printf("%sFlags%s\n", colorSection, colorReset)
+		flag.VisitAll(func(f *flag.Flag) {
+			fmt.Printf("  %s--%s%s %s%s%s\n",
+				colorHighlight, f.Name, colorReset,
+				colorDescription, f.Usage, colorReset,
+			)
+		})
+		fmt.Println()
+
+		fmt.Printf("%sQuick Start%s\n", colorSection, colorReset)
+		fmt.Printf("  %sMinimal:%s chicha-http-proxy --target-url https://example.com\n", colorHighlight, colorReset)
+		fmt.Printf("  %sAdvanced:%s chicha-http-proxy --target-url https://example.com --http-port 8080 --domain proxy.example.com --https-port 8443\n", colorHighlight, colorReset)
+		fmt.Println()
+
+		fmt.Printf("%sNotes%s\n", colorSection, colorReset)
+		fmt.Printf("  %s• Certificates fetched automatically when --domain is set.%s\n", colorDescription, colorReset)
+		fmt.Printf("  %s• Upstream TLS verification is disabled intentionally for trust-on-first-use scenarios.%s\n\n", colorDescription, colorReset)
+	}
+
 	// Define command-line flags
 	httpPort := flag.String("http-port", "80", "Port for the HTTP server. If -domain is set, this is forced to 80.")
 	httpsPort := flag.String("https-port", "443", "Port for the HTTPS server (only used if -domain is set).")
