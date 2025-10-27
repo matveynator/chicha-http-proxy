@@ -8,6 +8,7 @@ import (
 	"golang.org/x/crypto/acme/autocert"
 	"io"
 	"log"
+	"net"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -55,6 +56,16 @@ func proxyHandler(targetURL string) http.HandlerFunc {
 					req.Header.Add(header, value)
 				}
 			}
+
+			// Populate X-Forwarded-* headers so the upstream can recover client context.
+			// Using Set ensures we do not accumulate duplicates if the client already supplied values.
+			forwardedFor := r.RemoteAddr
+			if host, _, err := net.SplitHostPort(r.RemoteAddr); err == nil {
+				forwardedFor = host
+			}
+			req.Header.Set("X-Forwarded-For", forwardedFor)
+			req.Header.Set("X-Forwarded-Proto", "https")
+			req.Header.Set("X-Forwarded-Host", r.Host)
 
 			// Preserve the query string parameters
 			req.URL.RawQuery = r.URL.RawQuery
