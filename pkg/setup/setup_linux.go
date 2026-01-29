@@ -15,6 +15,16 @@ import (
 	"time"
 )
 
+// ----- Console styling -----
+
+const (
+	colorReset       = "\033[0m"
+	colorTitle       = "\033[38;5;45m"
+	colorSection     = "\033[38;5;33m"
+	colorHighlight   = "\033[38;5;214m"
+	colorDescription = "\033[38;5;244m"
+)
+
 // ----- Flag registration -----
 
 // RegisterFlag is split by build tags so non-Linux builds avoid exposing the setup flag.
@@ -41,6 +51,8 @@ type setupAnswers struct {
 
 // RunInteractive gathers setup details, installs the service, and writes runbook details to /etc/info.
 func RunInteractive() error {
+	printBanner()
+
 	answersCh := make(chan setupAnswers, 1)
 	promptErrCh := make(chan error, 1)
 	initCh := make(chan initDetectResult, 1)
@@ -69,6 +81,7 @@ func RunInteractive() error {
 	if initResult.err != nil {
 		return initResult.err
 	}
+	printDetectedInit(initResult.system)
 
 	binaryPath, err := os.Executable()
 	if err != nil {
@@ -81,15 +94,26 @@ func RunInteractive() error {
 	}
 
 	serviceConfig := buildServiceConfig(binaryPath, answers)
-	if err := writeServiceFiles(initResult.system, serviceConfig); err != nil {
+	serviceErr := writeServiceFiles(initResult.system, serviceConfig)
+	printServiceSummary(initResult.system, serviceConfig)
+
+	infoContent := renderInfo(initResult.system, serviceConfig, time.Now().Format(time.RFC3339))
+	if err := appendInfo(infoContent); err != nil {
 		return err
 	}
+	printInfoAppend(infoContent)
 
-	if err := appendInfo(initResult.system, serviceConfig); err != nil {
-		return err
+	if serviceErr != nil {
+		printCommandResult(commandResult{command: "service install", output: "", err: serviceErr})
 	}
 
-	return nil
+	startResult := attemptStartService(initResult.system)
+	printStartResult(startResult)
+
+	logsResult := attemptTailLogs(initResult.system, serviceConfig)
+	printLogsResult(logsResult)
+
+	return serviceErr
 }
 
 // ----- Prompt helpers -----
@@ -97,20 +121,21 @@ func RunInteractive() error {
 // promptAnswers coordinates input prompts so the caller can keep orchestration minimal.
 func promptAnswers() (setupAnswers, error) {
 	reader := bufio.NewReader(os.Stdin)
-	useHTTPS, err := promptYesNo(reader, "Use HTTPS for the public endpoint? (y/n): ")
+	useHTTPS, err := promptYesNo(reader, fmt.Sprintf("%sUse HTTPS for the public endpoint? (y/n): %s", colorSection, colorReset))
 	if err != nil {
 		return setupAnswers{}, err
 	}
 
 	domain := ""
 	if useHTTPS {
-		domain, err = promptNonEmpty(reader, "Enter the domain to secure with Let's Encrypt: ")
+		domain, err = promptNonEmpty(reader, fmt.Sprintf("%sEnter the domain to secure with Let's Encrypt: %s", colorSection, colorReset))
 		if err != nil {
 			return setupAnswers{}, err
 		}
 	}
 
-	target, err := promptNonEmpty(reader, "Where should requests be forwarded? (example: https://backend.local): ")
+	defaultTarget := "http://127.0.0.1:8080"
+	target, err := promptWithDefault(reader, fmt.Sprintf("%sWhere should requests be forwarded? (default %s): %s", colorSection, defaultTarget, colorReset), defaultTarget)
 	if err != nil {
 		return setupAnswers{}, err
 	}
@@ -159,6 +184,22 @@ func promptNonEmpty(reader *bufio.Reader, prompt string) (string, error) {
 			return answer, nil
 		}
 		fmt.Println("Value cannot be empty.")
+	}
+}
+
+// promptWithDefault returns a default value when the user presses enter.
+func promptWithDefault(reader *bufio.Reader, prompt string, fallback string) (string, error) {
+	for {
+		fmt.Print(prompt)
+		answer, err := reader.ReadString('\n')
+		if err != nil {
+			return "", fmt.Errorf("read answer: %w", err)
+		}
+		answer = strings.TrimSpace(answer)
+		if answer == "" {
+			return fallback, nil
+		}
+		return answer, nil
 	}
 }
 
@@ -370,10 +411,8 @@ exit 0
 // ----- /etc/info updates -----
 
 // appendInfo adds a runbook section to /etc/info with commands tailored to the init system.
-func appendInfo(system initSystem, cfg serviceConfig) error {
+func appendInfo(content string) error {
 	infoPath := "/etc/info"
-	now := time.Now().Format(time.RFC3339)
-	content := renderInfo(system, cfg, now)
 
 	file, err := os.OpenFile(infoPath, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
 	if err != nil {
@@ -416,4 +455,113 @@ func renderInfo(system initSystem, cfg serviceConfig, timestamp string) string {
 	}
 
 	return builder.String()
+}
+
+// ----- Operator feedback -----
+
+// printBanner introduces the setup with a friendly header.
+func printBanner() {
+	fmt.Printf("%sChicha HTTP Proxy Setup%s\n", colorTitle, colorReset)
+	fmt.Printf("%sInteractive Linux installer%s\n\n", colorDescription, colorReset)
+}
+
+// printDetectedInit highlights the init system so operators know what was chosen.
+func printDetectedInit(system initSystem) {
+	fmt.Printf("%sDetected init system:%s %s\n", colorSection, colorReset, system)
+}
+
+// printServiceSummary shows the generated service command line.
+func printServiceSummary(system initSystem, cfg serviceConfig) {
+	execLine := fmt.Sprintf("%s --target-url %s", cfg.binaryPath, cfg.targetURL)
+	if cfg.useHTTPS {
+		execLine = fmt.Sprintf("%s --domain %s", execLine, cfg.domain)
+	}
+	fmt.Printf("%sService command:%s %s\n", colorSection, colorReset, execLine)
+	fmt.Printf("%sService type:%s %s\n\n", colorSection, colorReset, system)
+}
+
+// printInfoAppend confirms the content added to /etc/info.
+func printInfoAppend(content string) {
+	fmt.Printf("%sAppended to /etc/info:%s\n%s\n", colorSection, colorReset, content)
+}
+
+// ----- Service start and logs -----
+
+// commandResult captures command execution so we can report to the operator.
+type commandResult struct {
+	command string
+	output  string
+	err     error
+}
+
+// attemptStartService tries to start the service and collect status output.
+func attemptStartService(system initSystem) []commandResult {
+	results := []commandResult{}
+
+	switch system {
+	case initSystemd:
+		results = append(results, runCommand("systemctl", "enable", "--now", "chicha-http-proxy"))
+		results = append(results, runCommand("systemctl", "status", "chicha-http-proxy", "--no-pager"))
+	case initInitd:
+		results = append(results, runCommand("service", "chicha-http-proxy", "start"))
+		results = append(results, runCommand("service", "chicha-http-proxy", "status"))
+	default:
+		results = append(results, commandResult{command: "init system unknown", output: "", err: errors.New("unsupported init system")})
+	}
+
+	return results
+}
+
+// attemptTailLogs fetches recent logs so operators see immediate output.
+func attemptTailLogs(system initSystem, cfg serviceConfig) []commandResult {
+	results := []commandResult{}
+
+	switch system {
+	case initSystemd:
+		results = append(results, runCommand("journalctl", "-u", "chicha-http-proxy", "-n", "50", "--no-pager"))
+	case initInitd:
+		results = append(results, runCommand("tail", "-n", "50", cfg.logFilePath))
+	default:
+		results = append(results, commandResult{command: "log system unknown", output: "", err: errors.New("unsupported init system")})
+	}
+
+	return results
+}
+
+// runCommand executes a command and captures combined output for display.
+func runCommand(name string, args ...string) commandResult {
+	cmd := exec.Command(name, args...)
+	output, err := cmd.CombinedOutput()
+	return commandResult{command: strings.Join(append([]string{name}, args...), " "), output: string(output), err: err}
+}
+
+// printStartResult renders service start and status output to the console.
+func printStartResult(results []commandResult) {
+	fmt.Printf("%sService startup attempts:%s\n", colorSection, colorReset)
+	for _, result := range results {
+		printCommandResult(result)
+	}
+}
+
+// printLogsResult renders log output for immediate troubleshooting.
+func printLogsResult(results []commandResult) {
+	fmt.Printf("%sService logs:%s\n", colorSection, colorReset)
+	for _, result := range results {
+		printCommandResult(result)
+	}
+}
+
+// printCommandResult formats a single command output block.
+func printCommandResult(result commandResult) {
+	status := "ok"
+	if result.err != nil {
+		status = "failed"
+	}
+	fmt.Printf("%s> %s%s (%s)%s\n", colorHighlight, result.command, colorReset, status, colorReset)
+	if result.output != "" {
+		fmt.Println(result.output)
+	}
+	if result.err != nil {
+		fmt.Printf("%sError:%s %v\n", colorHighlight, colorReset, result.err)
+	}
 }
