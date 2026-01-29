@@ -13,6 +13,8 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+
+	"chicha-proxy/pkg/setup"
 )
 
 // Program version (will be printed if the --version flag is used)
@@ -212,6 +214,7 @@ func main() {
 	domain := flag.String("domain", "", "Domain for automatic Let's Encrypt certificate. Forces HTTP port to 80 and admin rights, HTTPS can be changed.")
 	hostModeFlag := flag.String("host-mode", "domain", "Controls which host is forwarded upstream: 'domain' keeps the public name, 'target' preserves the backend host.")
 	showVersion := flag.Bool("version", false, "Show program version")
+	setupFlag := setup.RegisterFlag()
 
 	// Send log output to STDOUT so systemd captures it consistently.
 	log.SetOutput(os.Stdout)
@@ -223,6 +226,14 @@ func main() {
 	if *showVersion {
 		fmt.Printf("Program version: %s\n", version)
 		os.Exit(0)
+	}
+
+	// --setup runs the Linux-only interactive installation and then exits cleanly.
+	if setupFlag != nil && *setupFlag {
+		if err := setup.RunInteractive(); err != nil {
+			exitWithError("Setup failed", err)
+		}
+		return
 	}
 
 	// The target URL must be specified.
